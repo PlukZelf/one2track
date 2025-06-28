@@ -3,11 +3,11 @@ from datetime import timedelta, datetime
 from typing import List
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 import async_timeout
 from homeassistant.components.device_tracker.config_entry import TrackerEntity
-from homeassistant.core import callback
+from homeassistant.components.zone import async_active_zone
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
@@ -28,7 +28,6 @@ async def async_setup_entry(
         async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Add an entry."""
-    # Add the needed sensors to hass
     LOGGER.debug("one2track async_setup_entry")
 
     gps_api: GpsClient = hass.data[DOMAIN][entry.entry_id]['api_client']
@@ -60,9 +59,7 @@ class GpsCoordinator(DataUpdateCoordinator):
         super().__init__(
             hass,
             LOGGER,
-            # Name of the data. For logging purposes.
             name="One2Track",
-            # Polling interval. Will only be polled if there are subscribers.
             update_interval=timedelta(seconds=DEFAULT_UPDATE_RATE_SEC),
             always_update=False
         )
@@ -73,20 +70,11 @@ class GpsCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Fetch data from API endpoint."""
         try:
-            # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-            # handled by the data update coordinator.
             async with async_timeout.timeout(300):
-
-                #this caused issues in latest HA core?
-                #data = await (await self.hass.async_add_executor_job(
-                #    self.gps_api.update
-                #))
                 data = await self.gps_api.update()
-
                 LOGGER.debug("Update from the coordinator %s", data)
 
                 update = True
-
                 if update or self.first_boot:
                     LOGGER.debug("Updating sensor data. Last update: %s", self.last_update)
                     self.last_update = datetime.now()
@@ -117,25 +105,22 @@ class One2TrackSensor(CoordinatorEntity, TrackerEntity):
         self._device = device
         self._attr_unique_id = device['uuid']
         self._attr_name = f"one2track_{device['name']}"
+        self._zone_name = None  # cache for zone name
 
     @property
     def name(self):
-        """Return the name of the device."""
         return self._device['name']
 
     @property
     def source_type(self):
-        """Return the source type, eg gps or router, of the device."""
         return "gps"  # TODO: Could be router when status=WIFI
 
     def async_device_changed(self):
-        """Send changed data to HA"""
-        LOGGER.debug("%s (%d) advising HA of update", self.name, self.unique_id)
+        LOGGER.debug("%s (%s) advising HA of update", self.name, self.unique_id)
         self.async_schedule_update_ha_state()
 
     @property
     def location_accuracy(self):
-        """Return the gps accuracy of the device. In accuracy in meters"""
         return 10  # TODO check signal strength
 
     @property
@@ -144,7 +129,6 @@ class One2TrackSensor(CoordinatorEntity, TrackerEntity):
 
     @property
     def device_info(self):
-        """Return the device_info of the device."""
         return {
             "identifiers": {(DOMAIN, self.unique_id)},
             "serial_number": self._device['serial_number'],
@@ -157,7 +141,6 @@ class One2TrackSensor(CoordinatorEntity, TrackerEntity):
 
     @property
     def extra_state_attributes(self):
-        """Return device specific attributes."""
         return {
             "serial_number": self._device['serial_number'],
             "uuid": self._device['uuid'],
@@ -181,50 +164,44 @@ class One2TrackSensor(CoordinatorEntity, TrackerEntity):
 
     @property
     def battery_level(self):
-        """Return battery value of the device."""
         return self._device["last_location"]["battery_percentage"]
 
     @property
     def location_name(self):
-        """Return a location name for the current location of the device."""
         if self._device["last_location"]["location_type"] == 'WIFI':
             return 'home'
 
-        try:
-            zone_name = self._hass.components.zone.async_active_zone(self.latitude, self.longitude)
-            if zone_name:
-                return zone_name.name
-        except Exception as err:
-            LOGGER.error(f"Cannot get zone for tracker: {err}")
+        if self._zone_name:
+            return self._zone_name
 
         return self._device['last_location']['address']
 
     @property
     def latitude(self):
-        """Return latitude value of the device."""
         return float(self._device['last_location']['latitude'])
 
     @property
     def longitude(self):
-        """Return longitude value of the device."""
         return float(self._device['last_location']['longitude'])
 
     @property
     def unique_id(self):
-        """Return the unique ID."""
         return self._device['uuid']
 
-    async def async_added_to_hass(self):
-        """Register state update callback."""
-        await super().async_added_to_hass()
-
-    async def async_will_remove_from_hass(self):
-        """Clean up after entity before removal."""
-        await super().async_will_remove_from_hass()
+    async def _async_update_zone(self):
+        """Async update zone name based on current lat/lon."""
+        try:
+            zone = await async_active_zone(self._hass, self.latitude, self.longitude)
+            if zone:
+                self._zone_name = zone.name
+            else:
+                self._zone_name = None
+        except Exception as err:
+            LOGGER.error(f"Cannot get zone for tracker: {err}")
+            self._zone_name = None
 
     @callback
     def _update_from_latest_data(self) -> None:
-        """Update the entity from the latest data."""
         new_data: List[TrackerDevice] = self.coordinator.data
         me = next((x for x in new_data if x['uuid'] == self.unique_id), None)
         if me:
@@ -234,6 +211,12 @@ class One2TrackSensor(CoordinatorEntity, TrackerEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Respond to a DataUpdateCoordinator update."""
         self._update_from_latest_data()
-        self.async_write_ha_state()
+        self.async_schedule_update_ha_state()
+        self._hass.async_create_task(self._async_update_zone())
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+
+    async def async_will_remove_from_hass(self):
+        await super().async_will_remove_from_hass()
